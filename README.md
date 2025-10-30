@@ -1,1 +1,0 @@
-# CAMAL_project
