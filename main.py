@@ -1,172 +1,239 @@
-# Скрипт запуска упрощённого эксперимента CAMEL: двухагентный ролевой диалог + опциональный «судья»
+"""
+Simplified CAMEL experiment with:
+- Two-agent role-playing dialogue
+- Optional judge
+- JSONL logging and basic metrics collection
+"""
+
 import os
 import sys
-from typing import Optional, Any
+import json
+import uuid
+import re
+from datetime import datetime
+from typing import Optional, Any, Dict
 
 try:
-	# Базовые сущности CAMEL, используемые в эксперименте
-	from camel.societies import RolePlaying
-	from camel.messages import BaseMessage
-	from camel.agents import ChatAgent
-except Exception as e:
-	# Если пакет не установлен в текущем интерпретаторе
-	print("CAMEL is not installed. Please run: pip install camel-ai", file=sys.stderr)
-	raise
+    from camel.societies import RolePlaying
+    from camel.messages import BaseMessage
+    from camel.agents import ChatAgent
+except ImportError:
+    print("CAMEL is not installed. Run: pip install camel-ai", file=sys.stderr)
+    sys.exit(1)
 
 
-def _to_base_message(obj: Any) -> Optional[BaseMessage]:
-	"""Приводит ответ/объект к BaseMessage, если это ChatAgentResponse и т.п."""
-	if obj is None:
-		return None
-	# Уже BaseMessage
-	if isinstance(obj, BaseMessage):
-		return obj
-	# Ответ с полем .msg
-	msg = getattr(obj, "msg", None)
-	if isinstance(msg, BaseMessage):
-		return msg
-	# Ответ с коллекцией .msgs — берём последний элемент
-	msgs = getattr(obj, "msgs", None)
-	if isinstance(msgs, (list, tuple)) and msgs:
-		last = msgs[-1]
-		m = getattr(last, "msg", None)
-		if isinstance(m, BaseMessage):
-			return m
-		if isinstance(last, BaseMessage):
-			return last
-	return None
+
+# Utility helpers
+
+def getenv(name: str, default: Any, cast=str) -> Any:
+    val = os.getenv(name, str(default)).strip()
+    try:
+        return cast(val)
+    except Exception:
+        return default
 
 
-def getenv_str(name: str, default: str) -> str:
-	# Чтение строки из окружения с дефолтом
-	val = os.getenv(name)
-	return val if val is not None and val.strip() != "" else default
+def to_base_message(obj: Any) -> Optional[BaseMessage]:
+    """Safely converts various CAMEL response objects to BaseMessage."""
+    if obj is None:
+        return None
+    if isinstance(obj, BaseMessage):
+        return obj
+    msg = getattr(obj, "msg", None)
+    if isinstance(msg, BaseMessage):
+        return msg
+    msgs = getattr(obj, "msgs", None)
+    if isinstance(msgs, (list, tuple)) and msgs:
+        last = msgs[-1]
+        return getattr(last, "msg", last) if isinstance(last, (BaseMessage, object)) else None
+    return None
 
 
-def getenv_int(name: str, default: int) -> int:
-	# Чтение целого из окружения с безопасным парсингом
-	try:
-		return int(getenv_str(name, str(default)))
-	except Exception:
-		return default
+def print_msg(tag: str, msg: Any) -> None:
+    # Печатает сообщение в консоль, стараясь не упасть на неожиданных типах
+    try:
+        content = getattr(msg, "content", str(msg))
+        print(f"[{tag}]\n{content}\n")
+    except Exception:
+        print(f"[{tag}] <unprintable message>\n")
 
 
-def getenv_float(name: str, default: float) -> float:
-	# Чтение числа с плавающей точкой из окружения с безопасным парсингом
-	try:
-		return float(getenv_str(name, str(default)))
-	except Exception:
-		return default
+def should_print_dialog() -> bool:
+    # Флаг: выводить ли диалог по ходам (управляется переменной окружения)
+    return getenv("CAMEL_PRINT_DIALOG", "1").lower() not in ("0", "false", "no")
 
+
+# Metrics & Logging
+
+def extract_basic_metrics(dialog: list[BaseMessage]) -> Dict[str, Any]:
+    """Считает простые метрики по диалогу CAMEL (кол-во ходов, «водность», среднюю длину)."""
+    if not dialog:
+        return {}
+    text_concat = "\n".join(str(getattr(m, "content", "")) for m in dialog)
+    n_turns = len(dialog)
+    flake_count = len(re.findall(r"\b(I will|I can|I should|let me|I am going to)\b", text_concat, re.I))
+    flake_ratio = flake_count / max(1, n_turns)
+    avg_len = sum(len(str(getattr(m, "content", ""))) for m in dialog) / n_turns
+    return {
+        "turns": n_turns,
+        "flake_ratio": round(flake_ratio, 3),
+        "avg_msg_len": round(avg_len, 1),
+    }
+
+
+def log_dialog(run_info: dict, dialog: list[BaseMessage], final_msg: BaseMessage, info: dict):
+    """Записывает запись диалога в файл ``logs/dialogs.jsonl`` (по строке на запись)."""
+    os.makedirs("logs", exist_ok=True)
+    data = {
+        "id": str(uuid.uuid4()),
+        "timestamp": datetime.utcnow().isoformat(),
+        "assistant_model": run_info["model_a"],
+        "user_model": run_info["model_b"],
+        "task": run_info["task"],
+        "rounds": run_info["rounds"],
+        "stop_reason": info.get("stop_reason") if info else None,
+        "usage": info.get("usage") if info else None,
+        "metrics": extract_basic_metrics(dialog),
+        "final": getattr(final_msg, "content", ""),
+        "dialog": [
+            {
+                "role": getattr(m, "role_name", ""),
+                "content": getattr(m, "content", ""),
+            }
+            for m in dialog
+        ],
+    }
+    with open("logs/dialogs.jsonl", "a", encoding="utf8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+# Core experiment logic
 
 def run_role_playing() -> BaseMessage:
-	# Роли, задача и лимиты берём из окружения (с дефолтами)
-	assistant_role = getenv_str("CAMEL_ASSISTANT_ROLE", "Coder")
-	user_role = getenv_str("CAMEL_USER_ROLE", "Reviewer")
-	task = getenv_str("CAMEL_TASK", "Спроектировать простой CLI калькулятор и набросать тесты.")
+    """Запускает сессию ролевого взаимодействия двух агентов CAMEL.
 
-	rounds = getenv_int("CAMEL_ROUNDS", 8)
-	max_tokens = getenv_int("CAMEL_MAX_TOKENS", 192)
-	temperature = getenv_float("CAMEL_TEMPERATURE", 0.3)
+    - Настройки берутся из переменных окружения с дефолтами
+    - Агентам модель пробрасывается через ``assistant_agent_kwargs``/``user_agent_kwargs``
+    - Поддерживаются как современный API (``run``), так и легаси (``init_chat``/``step``)
+    """
+    run_info = {
+        "assistant_role": getenv("CAMEL_ASSISTANT_ROLE", "Coder"),
+        "user_role": getenv("CAMEL_USER_ROLE", "Reviewer"),
+        "task": getenv("CAMEL_TASK", "Спроектировать простой CLI калькулятор и написать тесты."),
+        "rounds": getenv("CAMEL_ROUNDS", 10, int),
+        "temperature": getenv("CAMEL_TEMPERATURE", 0.3, float),
+        "max_tokens": getenv("CAMEL_MAX_TOKENS", 384, int),
+        "model_a": getenv("AGENT_MODEL_A", "gpt-4o-mini"),
+        "model_b": getenv("AGENT_MODEL_B", "gpt-4o-mini"),
+    }
 
-	model_a = getenv_str("AGENT_MODEL_A", "gpt-4o-mini")
-	model_b = getenv_str("AGENT_MODEL_B", "gpt-4o-mini")
+    # Инициализируем сценарий ролевого взаимодействия
+    rp = RolePlaying(
+        assistant_role_name=run_info["assistant_role"],
+        user_role_name=run_info["user_role"],
+        task_prompt=run_info["task"],
+        with_task_specify=True,
+        assistant_agent_kwargs=dict(
+            model=run_info["model_a"],
+        ),
+        user_agent_kwargs=dict(
+            model=run_info["model_b"],
+        ),
+    )
 
-	# Создаём сценарий ролевого взаимодействия 
-	rp = RolePlaying(
-		assistant_role_name=assistant_role,
-		user_role_name=user_role,
-		task_prompt=task,
-		with_task_specify=True,
-	)
+    dialog, info, final_msg = [], {}, None
 
-	# API: единым вызовом прогоняет весь диалог
-	if hasattr(rp, "run"):
-		final_msg, _ = rp.run(n_rounds=rounds) if "n_rounds" in rp.run.__code__.co_varnames else rp.run()
-		return final_msg
+    # Современный API (предпочтительный путь)
+    if hasattr(rp, "run"):
+        result = rp.run(n_rounds=run_info["rounds"]) if "n_rounds" in rp.run.__code__.co_varnames else rp.run()
+        if isinstance(result, (list, tuple)):
+            final_msg = result[0]
+            if len(result) > 1 and isinstance(result[1], (list, dict)):
+                if isinstance(result[1], list):
+                    dialog = result[1]
+                elif isinstance(result[1], dict):
+                    info = result[1]
+        else:
+            final_msg = result
 
-	# Совместимость со старым API: init_chat() + цикл step(assistant_msg)
-	if hasattr(rp, "init_chat"):
-		try:
-			init_out = rp.init_chat()
-		except Exception:
-			init_out = None
-		assistant_msg = None
-		user_msg = None
-		# init_chat возвращает (assistant_resp, user_resp)
-		if isinstance(init_out, (list, tuple)) and len(init_out) >= 2:
-			assistant_msg = _to_base_message(init_out[0]) or init_out[0]
-			user_msg = _to_base_message(init_out[1]) or init_out[1]
-		else:
-			assistant_msg = _to_base_message(init_out) or init_out
+        if should_print_dialog() and dialog:
+            for i, m in enumerate(dialog, 1):
+                role = getattr(m, "role_name", "message")
+                print_msg(f"TURN {i} | {role}", m)
 
-		last_assistant: Optional[BaseMessage] = None
-		for _ in range(rounds):
-			if not hasattr(rp, "step"):
-				break
-			# Старому API нужен именно BaseMessage на вход
-			am = _to_base_message(assistant_msg) or assistant_msg
-			if not isinstance(am, BaseMessage):
-				break
-			step_out = rp.step(am)
-			# step возвращает (assistant_resp, user_resp)
-			if isinstance(step_out, (list, tuple)) and len(step_out) >= 2:
-				assistant_msg = _to_base_message(step_out[0]) or step_out[0]
-				user_msg = _to_base_message(step_out[1]) or step_out[1]
-				if isinstance(assistant_msg, BaseMessage):
-					last_assistant = assistant_msg
-			else:
-				maybe_assistant = _to_base_message(step_out)
-				if isinstance(maybe_assistant, BaseMessage):
-					last_assistant = maybe_assistant
-					assistant_msg = maybe_assistant
-				else:
-					break
+        log_dialog(run_info, dialog, final_msg, info)
+        return to_base_message(final_msg) or BaseMessage(role_name="assistant", content="(no output)")
 
-		return last_assistant if isinstance(last_assistant, BaseMessage) else BaseMessage(role_name="assistant", role_type="assistant", meta_dict={}, content="(no output)")
+    # Легаси-ветка на случай старых версий CAMEL
+    if hasattr(rp, "init_chat") and hasattr(rp, "step"):
+        init_out = rp.init_chat() or (None, None)
+        assistant_msg = to_base_message(init_out[0]) if isinstance(init_out, (list, tuple)) else to_base_message(init_out)
+        user_msg = to_base_message(init_out[1]) if isinstance(init_out, (list, tuple)) and len(init_out) > 1 else None
+        if assistant_msg:
+            dialog.append(assistant_msg)
+        if user_msg:
+            dialog.append(user_msg)
 
-	# Если ни один путь не сработал
-	return BaseMessage(role_name="assistant", role_type="assistant", meta_dict={}, content="(no output)")
+        for t in range(1, run_info["rounds"] + 1):
+            if not isinstance(assistant_msg, BaseMessage):
+                break
+            step_out = rp.step(assistant_msg)
+            if not step_out:
+                break
+            if isinstance(step_out, (list, tuple)):
+                assistant_msg = to_base_message(step_out[0])
+                user_msg = to_base_message(step_out[1]) if len(step_out) > 1 else None
+            else:
+                assistant_msg = to_base_message(step_out)
+            if assistant_msg:
+                dialog.append(assistant_msg)
+            if user_msg:
+                dialog.append(user_msg)
+            if should_print_dialog():
+                if assistant_msg: print_msg(f"TURN {t} | assistant", assistant_msg)
+                if user_msg: print_msg(f"TURN {t} | user", user_msg)
 
+        final_msg = assistant_msg or BaseMessage(role_name="assistant", content="(no output)")
+        log_dialog(run_info, dialog, final_msg, info)
+        return final_msg
+
+    # No valid API path
+    return BaseMessage(role_name="assistant", content="(no output)")
+
+# Optional judge 
 
 def maybe_judge(final_msg: BaseMessage) -> Optional[str]:
-	# Однопроходная оценка результата «судьёй» (если задана модель)
-	judge_model = os.getenv("JUDGE_MODEL")
-	if not judge_model:
-		return None
+    """Опционально прогоняет итог через «судью», если задан ``JUDGE_MODEL``.
 
-	prompt = (
-		"Оцени итоговое решение агента. Дай краткий вердикт (OK/ISSUES) и 1-2 рекомендации.\n\n"
-		f"Итоговое сообщение агента:\n{getattr(final_msg, 'content', str(final_msg))}"
-	)
-
-	# Простой однопроходный агент-судья (без длинной истории)
-	judge = ChatAgent(model_config={
-		"model": judge_model,
-		"max_tokens": getenv_int("CAMEL_JUDGE_MAX_TOKENS", 256),
-		"temperature": getenv_float("CAMEL_JUDGE_TEMPERATURE", 0.2),
-	})
-
-	resp = judge.step(prompt)
-	return getattr(resp.msg, "content", str(resp.msg))
+    Возвращает текст короткой оценки или ``None``.
+    """
+    model = os.getenv("JUDGE_MODEL")
+    if not model:
+        return None
+    prompt = (
+        "Оцени итоговое решение агента. Дай краткий вердикт (OK/ISSUES) и 1–2 рекомендации.\n\n"
+        f"Ответ агента:\n{getattr(final_msg, 'content', '')}"
+    )
+    judge = ChatAgent(model=model)
+    resp = judge.step(BaseMessage(role_name="user", role_type="user", content=prompt))
+    return getattr(resp.msg, "content", str(resp.msg))
 
 
-def main() -> None:
-	# Предупреждаем, если ключ/база провайдера не заданы
-	if not os.getenv("OPENAI_API_KEY") and not os.getenv("OPENAI_API_BASE"):
-		print("Warning: OPENAI_API_KEY не задан. Установите переменную окружения перед запуском.", file=sys.stderr)
 
-	# Запуск эксперимента
-	final_msg = run_role_playing()
-	print("\n=== FINAL MESSAGE ===\n")
-	print(getattr(final_msg, "content", str(final_msg)))
+# Entry point
 
-	# Опциональный прогон «судьи»
-	judge_text = maybe_judge(final_msg)
-	if judge_text:
-		print("\n=== JUDGE ===\n")
-		print(judge_text)
+def main():
+    if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_BASE")):
+        print("Warning: OPENAI_API_KEY не задан. Установите перед запуском.", file=sys.stderr)
+
+    final_msg = run_role_playing()
+    print("\n=== FINAL MESSAGE ===\n")
+    print(getattr(final_msg, "content", str(final_msg)))
+
+    if judge_text := maybe_judge(final_msg):
+        print("\n=== JUDGE ===\n")
+        print(judge_text)
 
 
 if __name__ == "__main__":
-	main()
+    main()
