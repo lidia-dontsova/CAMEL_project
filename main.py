@@ -1,8 +1,8 @@
 """
-Simplified CAMEL experiment with:
+CAMEL Experiment with:
 - Two-agent role-playing dialogue
-- Optional judge
-- JSONL logging and basic metrics collection
+- Always-on judge (LLM-based evaluation)
+- JSONL logging and full metric tracking
 """
 
 import os
@@ -22,8 +22,7 @@ except ImportError:
     sys.exit(1)
 
 
-
-# Utility helpers
+# Utility helpers 
 
 def getenv(name: str, default: Any, cast=str) -> Any:
     val = os.getenv(name, str(default)).strip()
@@ -50,7 +49,6 @@ def to_base_message(obj: Any) -> Optional[BaseMessage]:
 
 
 def print_msg(tag: str, msg: Any) -> None:
-    # Печатает сообщение в консоль, стараясь не упасть на неожиданных типах
     try:
         content = getattr(msg, "content", str(msg))
         print(f"[{tag}]\n{content}\n")
@@ -59,21 +57,21 @@ def print_msg(tag: str, msg: Any) -> None:
 
 
 def should_print_dialog() -> bool:
-    # Флаг: выводить ли диалог по ходам (управляется переменной окружения)
     return getenv("CAMEL_PRINT_DIALOG", "1").lower() not in ("0", "false", "no")
 
 
-# Metrics & Logging
+# Metrics & Logging 
 
 def extract_basic_metrics(dialog: list[BaseMessage]) -> Dict[str, Any]:
-    """Считает простые метрики по диалогу CAMEL (кол-во ходов, «водность», среднюю длину)."""
+    """Считает простые метрики по диалогу."""
     if not dialog:
         return {}
-    text_concat = "\n".join(str(getattr(m, "content", "")) for m in dialog)
+    texts = [str(getattr(m, "content", "")) for m in dialog]
+    text_concat = "\n".join(texts)
     n_turns = len(dialog)
     flake_count = len(re.findall(r"\b(I will|I can|I should|let me|I am going to)\b", text_concat, re.I))
     flake_ratio = flake_count / max(1, n_turns)
-    avg_len = sum(len(str(getattr(m, "content", ""))) for m in dialog) / n_turns
+    avg_len = sum(len(t) for t in texts) / n_turns
     return {
         "turns": n_turns,
         "flake_ratio": round(flake_ratio, 3),
@@ -81,9 +79,13 @@ def extract_basic_metrics(dialog: list[BaseMessage]) -> Dict[str, Any]:
     }
 
 
-def log_dialog(run_info: dict, dialog: list[BaseMessage], final_msg: BaseMessage, info: dict):
-    """Записывает запись диалога в файл ``logs/dialogs.jsonl`` (по строке на запись)."""
+def log_dialog(run_info: dict, dialog: list[BaseMessage], final_msg: BaseMessage, info: dict, judge_verdict: str):
+    """Сохраняет весь эксперимент (включая вердикт судьи) в logs/dialogs.jsonl"""
     os.makedirs("logs", exist_ok=True)
+    metrics = extract_basic_metrics(dialog)
+    metrics["judge_verdict"] = judge_verdict
+    metrics["success_flag"] = "OK" in judge_verdict.upper() or "SUCCESS" in judge_verdict.upper()
+
     data = {
         "id": str(uuid.uuid4()),
         "timestamp": datetime.utcnow().isoformat(),
@@ -91,9 +93,9 @@ def log_dialog(run_info: dict, dialog: list[BaseMessage], final_msg: BaseMessage
         "user_model": run_info["model_b"],
         "task": run_info["task"],
         "rounds": run_info["rounds"],
+        "metrics": metrics,
         "stop_reason": info.get("stop_reason") if info else None,
         "usage": info.get("usage") if info else None,
-        "metrics": extract_basic_metrics(dialog),
         "final": getattr(final_msg, "content", ""),
         "dialog": [
             {
@@ -103,88 +105,92 @@ def log_dialog(run_info: dict, dialog: list[BaseMessage], final_msg: BaseMessage
             for m in dialog
         ],
     }
+
     with open("logs/dialogs.jsonl", "a", encoding="utf8") as f:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
-# Core experiment logic
+#  Core logic 
 
-def run_role_playing() -> BaseMessage:
-    """Запускает сессию ролевого взаимодействия двух агентов CAMEL.
-
-    - Настройки берутся из переменных окружения с дефолтами
-    - Агентам модель пробрасывается через ``assistant_agent_kwargs``/``user_agent_kwargs``
-    - Поддерживаются как современный API (``run``), так и легаси (``init_chat``/``step``)
-    """
+def run_role_playing() -> tuple[BaseMessage, list[BaseMessage], dict]:
+    """Запускает ролевой диалог CAMEL и возвращает (final_msg, dialog, info)."""
     run_info = {
         "assistant_role": getenv("CAMEL_ASSISTANT_ROLE", "Coder"),
         "user_role": getenv("CAMEL_USER_ROLE", "Reviewer"),
-        "task": getenv("CAMEL_TASK", "Спроектировать простой CLI калькулятор и написать тесты."),
-        "rounds": getenv("CAMEL_ROUNDS", 10, int),
+        "task": getenv("CAMEL_TASK", "Спроектировать CLI калькулятор и написать тесты."),
+        "rounds": getenv("CAMEL_ROUNDS", 8, int),
         "temperature": getenv("CAMEL_TEMPERATURE", 0.3, float),
         "max_tokens": getenv("CAMEL_MAX_TOKENS", 384, int),
         "model_a": getenv("AGENT_MODEL_A", "gpt-4o-mini"),
         "model_b": getenv("AGENT_MODEL_B", "gpt-4o-mini"),
     }
 
-    # Инициализируем сценарий ролевого взаимодействия
     rp = RolePlaying(
         assistant_role_name=run_info["assistant_role"],
         user_role_name=run_info["user_role"],
         task_prompt=run_info["task"],
         with_task_specify=True,
-        assistant_agent_kwargs=dict(
-            model=run_info["model_a"],
-        ),
-        user_agent_kwargs=dict(
-            model=run_info["model_b"],
-        ),
+        assistant_agent_kwargs=dict(model=run_info["model_a"]),
+        user_agent_kwargs=dict(model=run_info["model_b"]),
     )
 
     dialog, info, final_msg = [], {}, None
 
-    # Современный API (предпочтительный путь)
+    # Попытка использовать современный API (run)
     if hasattr(rp, "run"):
-        result = rp.run(n_rounds=run_info["rounds"]) if "n_rounds" in rp.run.__code__.co_varnames else rp.run()
-        if isinstance(result, (list, tuple)):
-            final_msg = result[0]
-            if len(result) > 1 and isinstance(result[1], (list, dict)):
-                if isinstance(result[1], list):
-                    dialog = result[1]
-                elif isinstance(result[1], dict):
-                    info = result[1]
-        else:
-            final_msg = result
+        try:
+            result = rp.run(n_rounds=run_info["rounds"]) if "n_rounds" in rp.run.__code__.co_varnames else rp.run()
+            if isinstance(result, (list, tuple)):
+                final_msg = result[0]
+                if len(result) > 1:
+                    if isinstance(result[1], list):
+                        dialog = result[1]
+                    elif isinstance(result[1], dict):
+                        info = result[1]
+            else:
+                final_msg = result
+        except Exception as e:
+            # Если run() не сработал, используем легаси-API
+            print(f"Warning: run() failed ({e}), falling back to init_chat/step", file=sys.stderr)
+            final_msg, dialog = None, []
 
-        if should_print_dialog() and dialog:
-            for i, m in enumerate(dialog, 1):
-                role = getattr(m, "role_name", "message")
-                print_msg(f"TURN {i} | {role}", m)
-
-        log_dialog(run_info, dialog, final_msg, info)
-        return to_base_message(final_msg) or BaseMessage(role_name="assistant", content="(no output)")
-
-    # Легаси-ветка на случай старых версий CAMEL
-    if hasattr(rp, "init_chat") and hasattr(rp, "step"):
-        init_out = rp.init_chat() or (None, None)
-        assistant_msg = to_base_message(init_out[0]) if isinstance(init_out, (list, tuple)) else to_base_message(init_out)
-        user_msg = to_base_message(init_out[1]) if isinstance(init_out, (list, tuple)) and len(init_out) > 1 else None
+    # Легаси-API через init_chat и step
+    if final_msg is None and hasattr(rp, "init_chat") and hasattr(rp, "step"):
+        init_msg = rp.init_chat()
+        assistant_msg = to_base_message(init_msg)
         if assistant_msg:
             dialog.append(assistant_msg)
-        if user_msg:
-            dialog.append(user_msg)
 
         for t in range(1, run_info["rounds"] + 1):
             if not isinstance(assistant_msg, BaseMessage):
                 break
             step_out = rp.step(assistant_msg)
-            if not step_out:
+            if not step_out or not isinstance(step_out, (list, tuple)) or len(step_out) < 2:
                 break
-            if isinstance(step_out, (list, tuple)):
-                assistant_msg = to_base_message(step_out[0])
-                user_msg = to_base_message(step_out[1]) if len(step_out) > 1 else None
-            else:
-                assistant_msg = to_base_message(step_out)
+            
+            # step() возвращает (ChatAgentResponse, ChatAgentResponse)
+            assistant_response, user_response = step_out[0], step_out[1]
+            
+            # Собираем info из ответов
+            if assistant_response.info:
+                info.update(assistant_response.info)
+            if user_response.info:
+                info.update(user_response.info)
+            
+            # Проверяем, не завершился ли диалог
+            if assistant_response.terminated or user_response.terminated:
+                if assistant_response.msgs:
+                    assistant_msg = to_base_message(assistant_response.msgs[0])
+                if user_response.msgs:
+                    user_msg = to_base_message(user_response.msgs[0])
+                    if user_msg:
+                        dialog.append(user_msg)
+                break
+            
+            # Извлекаем сообщения из ChatAgentResponse
+            assistant_msg = to_base_message(assistant_response.msgs[0]) if assistant_response.msgs else None
+            user_msg = to_base_message(user_response.msgs[0]) if user_response.msgs else None
+            
             if assistant_msg:
                 dialog.append(assistant_msg)
             if user_msg:
@@ -193,46 +199,61 @@ def run_role_playing() -> BaseMessage:
                 if assistant_msg: print_msg(f"TURN {t} | assistant", assistant_msg)
                 if user_msg: print_msg(f"TURN {t} | user", user_msg)
 
-        final_msg = assistant_msg or BaseMessage(role_name="assistant", content="(no output)")
-        log_dialog(run_info, dialog, final_msg, info)
-        return final_msg
+        final_msg = assistant_msg or BaseMessage.make_assistant_message(role_name="assistant", content="(no output)")
 
-    # No valid API path
-    return BaseMessage(role_name="assistant", content="(no output)")
+    # Если ничего не сработало
+    if final_msg is None:
+        final_msg = BaseMessage.make_assistant_message(role_name="assistant", content="(no output)")
 
-# Optional judge 
+    if should_print_dialog() and dialog:
+        for i, m in enumerate(dialog, 1):
+            role = getattr(m, "role_name", "message")
+            print_msg(f"TURN {i} | {role}", m)
 
-def maybe_judge(final_msg: BaseMessage) -> Optional[str]:
-    """Опционально прогоняет итог через «судью», если задан ``JUDGE_MODEL``.
+    return to_base_message(final_msg) or BaseMessage.make_assistant_message(role_name="assistant", content="(no output)"), dialog, info
 
-    Возвращает текст короткой оценки или ``None``.
-    """
-    model = os.getenv("JUDGE_MODEL")
-    if not model:
-        return None
+
+# Always-on Judge 
+
+def run_judge(final_msg: BaseMessage) -> str:
+    """Прогоняет финальный ответ через судью LLM."""
+    model = getenv("JUDGE_MODEL", "gpt-4o-mini")
     prompt = (
-        "Оцени итоговое решение агента. Дай краткий вердикт (OK/ISSUES) и 1–2 рекомендации.\n\n"
-        f"Ответ агента:\n{getattr(final_msg, 'content', '')}"
+        "Classify the agent’s final answer as one of the following:\n"
+        "SUCCESS — The task is clearly solved.\n"
+        "PARTIAL — Some progress but incomplete.\n"
+        "FAIL — The task is not solved or irrelevant.\n\n"
+        f"Task answer:\n{getattr(final_msg, 'content', '')}\n\n"
+        "Also provide 1–2 short recommendations for improvement."
     )
+
     judge = ChatAgent(model=model)
-    resp = judge.step(BaseMessage(role_name="user", role_type="user", content=prompt))
-    return getattr(resp.msg, "content", str(resp.msg))
+    resp = judge.step(BaseMessage.make_user_message(role_name="user", content=prompt))
+    return getattr(resp.msg, "content", "").strip() or "(no verdict)"
 
 
-
-# Entry point
+#  Entry point 
 
 def main():
     if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_BASE")):
-        print("Warning: OPENAI_API_KEY не задан. Установите перед запуском.", file=sys.stderr)
+        print("Warning: OPENAI_API_KEY not set.", file=sys.stderr)
 
-    final_msg = run_role_playing()
+    final_msg, dialog, info = run_role_playing()
     print("\n=== FINAL MESSAGE ===\n")
-    print(getattr(final_msg, "content", str(final_msg)))
+    print(getattr(final_msg, "content", "(no output)"))
 
-    if judge_text := maybe_judge(final_msg):
-        print("\n=== JUDGE ===\n")
-        print(judge_text)
+    print("\n=== JUDGE ===\n")
+    judge_text = run_judge(final_msg)
+    print(judge_text)
+
+    # Save logs with metrics + verdict
+    run_info = {
+        "model_a": getenv("AGENT_MODEL_A", "gpt-4o-mini"),
+        "model_b": getenv("AGENT_MODEL_B", "gpt-4o-mini"),
+        "task": getenv("CAMEL_TASK", "CLI calculator"),
+        "rounds": getenv("CAMEL_ROUNDS", 8, int),
+    }
+    log_dialog(run_info, dialog, final_msg, info, judge_text)
 
 
 if __name__ == "__main__":
