@@ -356,6 +356,7 @@ def main():
         models_to_test = [
             "gpt-4o-mini",
             "gpt-3.5-turbo",
+            "gpt-3.5-turbo-0125",
         ]
 
         successful = 0
@@ -372,12 +373,16 @@ def main():
                 failed += 1
                 error_msg = str(e)
                 # Если это региональная ошибка или ошибка доступа, пропускаем модель
-                if "unsupported_country" in error_msg.lower() or "permission denied" in error_msg.lower() or "403" in error_msg:
-                    print(f"\n❌ Skipping {model}: Access denied (region/API issue)", file=sys.stderr)
+                if ("unsupported_country" in error_msg.lower() or 
+                    "permission denied" in error_msg.lower() or 
+                    "insufficient permissions" in error_msg.lower() or
+                    "403" in error_msg or 
+                    "401" in error_msg):
+                    print(f"\nSkipping {model}: Access denied (region/API issue or insufficient permissions)", file=sys.stderr)
                     print(f"   Error details: {error_msg[:200]}", file=sys.stderr)
                     print(f"   This model is not available in your region or API access is restricted.\n")
                 else:
-                    print(f"\n❌ Error running experiment for {model}: {e}", file=sys.stderr)
+                    print(f"\nError running experiment for {model}: {e}", file=sys.stderr)
                     import traceback
                     print("   Traceback:", file=sys.stderr)
                     traceback.print_exc()
