@@ -368,8 +368,8 @@ def run_judge(final_msg: BaseMessage, task: str) -> Tuple[str, float]:
     prompt = (
         "Evaluate the assistant's final answer for task relevance.\n"
         "Return two parts:\n"
-        "1️. Classification: SUCCESS / PARTIAL / FAIL.\n"
-        "2️. Numerical score (1–10) for how relevant and correct the answer is.\n\n"
+        "1. Classification: SUCCESS / PARTIAL / FAIL.\n"
+        "2. Numerical score (1–10) for how relevant and correct the answer is.\n\n"
         f"Task:\n{task}\n\n"
         f"Answer:\n{answer}\n\n"
         "Respond in format:\n"
