@@ -1,10 +1,10 @@
 """
-CAMEL Experiment (Extended Version)
+CAMEL эксперимент 
 -----------------------------------
-- Multi-domain task (5 domains × 3 tasks)
-- Always-on LLM Judge (classification + 1–10 relevance score)
-- Enhanced metrics: flake_ratio, completion_rate, time_per_round
-- JSONL logging with domain tagging
+- 5 тематик × 3 задачи
+- Обязательный судья, который классифицирует решение и оценивает его релевантность 
+- Метрики: flake_ratio, completion_rate, time_per_round
+- Логирование в JSONL
 """
 
 import os
@@ -16,6 +16,7 @@ import time
 from datetime import datetime
 from typing import Optional, Any, Dict, Tuple, List
 
+# Импорт модулей CAMEL
 try:
     from camel.societies import RolePlaying
     from camel.messages import BaseMessage
@@ -25,7 +26,7 @@ except ImportError:
     sys.exit(1)
 
 
-# ========== Utility helpers ==========
+# Вспомогательные функции
 
 def getenv(name: str, default: Any, cast=str) -> Any:
     val = os.getenv(name, str(default)).strip()
@@ -34,9 +35,8 @@ def getenv(name: str, default: Any, cast=str) -> Any:
     except Exception:
         return default
 
-
+# Преобразование объектов CAMEL в BaseMessage (общий интерфейс для всех моделей)
 def to_base_message(obj: Any) -> Optional[BaseMessage]:
-    """Safely converts various CAMEL response objects to BaseMessage."""
     if obj is None:
         return None
     if isinstance(obj, BaseMessage):
@@ -50,7 +50,7 @@ def to_base_message(obj: Any) -> Optional[BaseMessage]:
         return getattr(last, "msg", last) if isinstance(last, (BaseMessage, object)) else None
     return None
 
-
+# Вывод сообщения в консоль
 def print_msg(tag: str, msg: Any) -> None:
     try:
         content = getattr(msg, "content", str(msg))
@@ -58,29 +58,25 @@ def print_msg(tag: str, msg: Any) -> None:
     except Exception:
         print(f"[{tag}] <unprintable message>\n")
 
-
+# Проверка на наличие маркера завершения задачи
 def has_task_done_marker(msg: Any) -> bool:
-    """Checks if message contains task completion marker."""
     if msg is None:
         return False
     content = getattr(msg, "content", str(msg))
-    # Check for exact marker (case-insensitive)
     markers = ["<CAMEL_TASK_DONE>", "<camel_task_done>", "task done", "task completed"]
     content_lower = content.lower()
     return any(marker.lower() in content_lower for marker in markers)
 
 
-# ========== Metrics ==========
-
+# Расчет основных метрик
 def extract_basic_metrics(dialog: list[BaseMessage], rounds: int, elapsed_time: float, task_done: bool) -> Dict[str, Any]:
-    """Compute basic metrics for a dialog."""
     if not dialog:
         return {}
     texts = [str(getattr(m, "content", "")) for m in dialog]
     text_concat = "\n".join(texts)
     n_turns = len(dialog)
 
-    # Improved flake_ratio: count vague or filler phrases
+    # Расчет flake_ratio: количество нечетких или заполнительных фраз
     flake_patterns = re.findall(
         r"\b(I will|I can|I should|let me|I am going to|maybe|perhaps|I think|I guess)\b",
         text_concat,
@@ -100,10 +96,9 @@ def extract_basic_metrics(dialog: list[BaseMessage], rounds: int, elapsed_time: 
     }
 
 
-# ========== Logging ==========
+# Логирование результатов эксперимента
 
 def log_dialog(run_info: dict, dialog: list[BaseMessage], final_msg: BaseMessage, info: dict, metrics: dict):
-    """Saves full experiment results into logs/dialogs.jsonl."""
     os.makedirs("logs", exist_ok=True)
 
     data = {
@@ -123,20 +118,19 @@ def log_dialog(run_info: dict, dialog: list[BaseMessage], final_msg: BaseMessage
             for m in dialog
         ],
     }
-
+	# Запись результатов в файл
     with open("logs/dialogs.jsonl", "a", encoding="utf8") as f:
         f.write(json.dumps(data, ensure_ascii=False) + "\n")
 
 
-# ========== Core logic ==========
+# Основная логика эксперимента
 
 def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> Tuple[BaseMessage, List[BaseMessage], dict, bool, float]:
-    """Run CAMEL two-agent role-playing."""
     start_time = time.time()
     task_done = False
     dialog, info, final_msg = [], {}, None
 
-    # Add completion instructions to task
+    # Добавление инструкций для завершения задачи
     task_with_completion = (
         f"{task}\n\n"
         "IMPORTANT: When the task is fully completed and the solution is ready, "
@@ -145,7 +139,7 @@ def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> 
         "the conversation will stop and the final solution will be extracted."
     )
 
-    # Initialize RolePlaying
+    # Инициализация RolePlaying
     rp = RolePlaying(
         assistant_role_name="Coder",
         user_role_name="Reviewer",
@@ -155,21 +149,21 @@ def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> 
         user_agent_kwargs=dict(model=model_b),
     )
 
-    # Run conversation (legacy-safe)
+    # Запуск диалога 
     if hasattr(rp, "run"):
         try:
             result = rp.run(n_rounds=rounds) if "n_rounds" in rp.run.__code__.co_varnames else rp.run()
-            # Handle different result formats
+            # Обработка различных форматов результатов
             if isinstance(result, (list, tuple)):
                 if len(result) >= 2:
-                    # Try to extract final_msg from first element
+                    # Извлечение final_msg из первого элемента
                     first = result[0]
                     if hasattr(first, "msgs") and first.msgs:
                         final_msg = to_base_message(first.msgs[0])
                     else:
                         final_msg = to_base_message(first)
                     
-                    # Extract dialog from second element
+                    # Извлечение диалога из второго элемента
                     second = result[1]
                     if isinstance(second, list):
                         dialog = [to_base_message(m) for m in second if m is not None]
@@ -183,7 +177,7 @@ def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> 
                     elif isinstance(second, dict):
                         info = second
             else:
-                # Single result - try to extract message
+                # Одиночный результат - извлечение сообщения
                 if hasattr(result, "msgs") and result.msgs:
                     final_msg = to_base_message(result.msgs[0])
                 else:
@@ -192,7 +186,7 @@ def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> 
             print(f"Warning: run() failed ({e}), falling back to init_chat/step", file=sys.stderr)
             final_msg, dialog = None, []
 
-    # Fallback to legacy API if needed
+    # Резервное копирование 
     if (final_msg is None or not getattr(to_base_message(final_msg), "content", "").strip()) and hasattr(rp, "init_chat") and hasattr(rp, "step"):
         dialog = []
         info = {}
@@ -223,17 +217,17 @@ def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> 
             if getattr(user_response, "info", None):
                 info.update(user_response.info)
 
-            # Extract messages from current step
+            # Извлечение сообщений из текущего шага
             next_assistant = to_base_message(assistant_response.msgs[0]) if getattr(assistant_response, "msgs", None) else None
             next_user = to_base_message(user_response.msgs[0]) if getattr(user_response, "msgs", None) else None
 
-            # Check for completion marker - stop dialog if found
+            # Проверка на наличие маркера завершения задачи, остановка диалога если найден
             if has_task_done_marker(next_user) or has_task_done_marker(next_assistant):
                 task_done = True
                 print(f"\n[Task completion marker detected at turn {t} - stopping dialog]", file=sys.stderr)
                 break
 
-            # Add messages to dialog
+            # Добавление сообщений в диалог
             if next_user:
                 dialog.append(next_user)
             if next_assistant:
@@ -241,22 +235,22 @@ def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> 
 
             assistant_msg = next_assistant
 
-            # Check termination
+            # Проверка на завершение диалога
             if getattr(assistant_response, "terminated", False) or getattr(user_response, "terminated", False):
                 break
 
         final_msg = assistant_msg or BaseMessage.make_assistant_message(role_name="assistant", content="(no output)")
 
-    # Extract final message from dialog if still missing
+    # Извлечение финального сообщения из диалога если его еще нет
     if final_msg is None or not getattr(to_base_message(final_msg), "content", "").strip():
-        # Look for last meaningful assistant message
+        # Поиск последнего значимого сообщения от помощника
         farewell_phrases = [
             "have a great day", "have a wonderful day", "free to ask", "need further assistance",
             "more requests", "more tasks", "any more", "future tasks"
         ]
         solution_keywords = ["solution:", "code:", "def ", "import ", "class ", "```"]
         
-        # First, look for solution message
+        # Сначала ищем сообщение с решением
         for msg in reversed(dialog):
             normalized = to_base_message(msg)
             if normalized and getattr(normalized, "role_name", "").lower() in ("assistant", "coder"):
@@ -267,7 +261,7 @@ def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> 
                         final_msg = normalized
                         break
         
-        # If no solution found, get last non-farewell assistant message
+        # Если решение не найдено, извлекаем последнее значимое сообщение от помощника
         if final_msg is None or not getattr(to_base_message(final_msg), "content", "").strip():
             for msg in reversed(dialog):
                 normalized = to_base_message(msg)
@@ -278,7 +272,7 @@ def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> 
                         final_msg = normalized
                         break
 
-    # Detect completion marker
+    # Проверка на наличие маркера завершения задачи
     if not task_done:
         for msg in dialog:
             if has_task_done_marker(msg):
@@ -290,14 +284,13 @@ def run_role_playing(model_a: str, model_b: str, task: str, rounds: int = 8) -> 
     return to_base_message(final_msg) or BaseMessage.make_assistant_message(role_name="assistant", content="(no output)"), dialog, info, task_done, elapsed
 
 
-# ========== Solution Summarization ==========
+# Воспроизведение диалога и извлечение финального решения
 
 def summarize_dialog_solution(dialog: List[BaseMessage], task: str) -> BaseMessage:
-    """Summarize the entire dialog and extract the final solution."""
     if not dialog:
         return BaseMessage.make_assistant_message(role_name="assistant", content="(no dialog)")
     
-    # Collect all assistant (Coder) messages
+    # Сбор всех сообщений от помощника 
     assistant_messages = []
     for msg in dialog:
         normalized = to_base_message(msg)
@@ -311,10 +304,10 @@ def summarize_dialog_solution(dialog: List[BaseMessage], task: str) -> BaseMessa
     if not assistant_messages:
         return BaseMessage.make_assistant_message(role_name="assistant", content="(no assistant messages)")
     
-    # Combine all assistant messages
+    # Объединение всех сообщений от помощника
     full_dialog_text = "\n\n---\n\n".join(assistant_messages)
     
-    # Use LLM to summarize and extract final solution
+    # Использование LLM для воспроизведения диалога и извлечения финального решения
     model = getenv("JUDGE_MODEL", "gpt-4o-mini")
     prompt = (
         "Analyze the following conversation between a Coder and Reviewer working on a task.\n"
@@ -341,16 +334,16 @@ def summarize_dialog_solution(dialog: List[BaseMessage], task: str) -> BaseMessa
     except Exception as e:
         print(f"Warning: Solution summarization failed ({e}), using last assistant message", file=sys.stderr)
     
-    # Fallback: extract code blocks and key solution parts from last messages
+    # Резервное копирование: извлечение кода и ключевых частей решения из последних сообщений
     solution_parts = []
     code_blocks = re.findall(r"```(?:python|javascript|java|c\+\+|go|rust|sql)?\n(.*?)```", full_dialog_text, re.DOTALL)
     if code_blocks:
         solution_parts.append("```python\n" + code_blocks[-1] + "\n```")
     
-    # Look for solution keywords in last few messages
+    # Поиск ключевых слов решения в последних сообщениях
     for msg_text in reversed(assistant_messages[-3:]):
         if any(keyword in msg_text.lower() for keyword in ["solution:", "final:", "answer:", "result:"]):
-            # Extract text after solution marker
+            # Извлечение текста после маркера решения
             match = re.search(r"(?:solution|final|answer|result)[:\s]*(.*)", msg_text, re.I | re.DOTALL)
             if match:
                 solution_parts.append(match.group(1).strip())
@@ -359,17 +352,16 @@ def summarize_dialog_solution(dialog: List[BaseMessage], task: str) -> BaseMessa
     if solution_parts:
         return BaseMessage.make_assistant_message(role_name="assistant", content="\n\n".join(solution_parts))
     
-    # Last resort: return last assistant message
+    # Резервное копирование: возврат последнего сообщения от помощника
     return BaseMessage.make_assistant_message(
         role_name="assistant", 
         content=assistant_messages[-1] if assistant_messages else "(no solution found)"
     )
 
 
-# ========== Judge ==========
+# Судья
 
 def run_judge(final_msg: BaseMessage, task: str) -> Tuple[str, float]:
-    """Judge model's final answer: classification + 1–10 relevance score."""
     model = getenv("JUDGE_MODEL", "gpt-4o-mini")
     answer = getattr(final_msg, "content", "")
 
@@ -402,7 +394,7 @@ def run_judge(final_msg: BaseMessage, task: str) -> Tuple[str, float]:
         return "FAIL", 0.0
 
 
-# ========== Tasks & Main loop ==========
+# Задачи 
 
 task_groups = {
     "Programming": [
@@ -432,7 +424,7 @@ task_groups = {
     ],
 }
 
-
+# Основная функция эксперимента
 def main():
     try:
         if not (os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API_BASE")):
@@ -466,7 +458,7 @@ def main():
                         print(f"Error running {model}: {e}")
                         continue
 
-                    # Summarize dialog to extract final solution
+                    # Воспроизведение диалога и извлечение финального решения
                     final_msg = summarize_dialog_solution(dialog, task)
                     verdict, relevance = run_judge(final_msg, task)
 
@@ -486,7 +478,7 @@ def main():
 
                     log_dialog(run_info, dialog, final_msg, info, metrics)
 
-                    # Print full dialog
+                    # Вывод полного диалога
                     if dialog:
                         print(f"\n=== FULL DIALOG ({len(dialog)} messages) ===")
                         for i, msg in enumerate(dialog, 1):
@@ -502,7 +494,7 @@ def main():
         print(f"\n{'='*80}")
         print(f"Summary: {successful} successful, {failed} failed")
         print(f"{'='*80}")
-
+	# Обработка прерываний и ошибок
     except KeyboardInterrupt:
         print("\nInterrupted by user", file=sys.stderr)
         sys.exit(1)
